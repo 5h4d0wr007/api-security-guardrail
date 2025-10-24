@@ -38,6 +38,17 @@ jobs:
           node-version: '20'
       - run: npm ci
 
+      - name: Sanity check planner source
+        run: |
+          echo "---- print first 140 lines of planner ----"
+          nl -ba scripts/plan_and_generate_tests.js | sed -n '1,140p'
+          echo "---- scan for \${ tokens in repo ----"
+          if grep -R '\${' -n scripts postman . | grep -v '\.git'; then
+            echo "ERROR: Found \${ ... } in source. Remove/escape these."; exit 1;
+          else
+            echo "OK: no \${ found in source";
+          fi
+
       # 4) Plan tests (generic OWASP Top-10)
       - name: Plan & generate tests
         run: npm run plan
