@@ -1,3 +1,4 @@
+// scripts/plan_and_generate_tests.js
 import fs from "fs/promises";
 import path from "path";
 import OpenAI from "openai";
@@ -55,25 +56,21 @@ async function main() {
   const apiSummary = summarizeCollection(baseCollection);
   const recentChanges = process.env.PR_DIFF_SUMMARY || "(none)";
 
-  const PROMPT_TEMPLATE = `
-  <<<PROMPT>>>
-  `.trim();
-
-  // Paste the prompt from section 6 and replace these tokens:
-  const PROMPT = PROMPT_TEMPLATE
-    .replace("<<<PROMPT>>>", `You are an API security test planner. Goal: generate targeted, minimal, high-signal
+  // IMPORTANT: Use String.raw and escape ${...} → \${...}
+  const PROMPT = String.raw`
+You are an API security test planner. Goal: generate targeted, minimal, high-signal
 tests for the API described below, mapped to OWASP API Security Top 10 (2023).
 
 === CONTEXT ===
 - API summary (from Postman collection):
-${api_summary}
+\${api_summary}
 
 - Recent PR changes (optional; may be empty):
-${recent_changes}
+\${recent_changes}
 
-- Execution base URL: ${url}
+- Execution base URL: \${base_url}
 
-- Org policy: ${policy}
+- Org policy: \${policy}
 
 === RULES & PRIORITIES ===
 Use OWASP API Security Top 10 (2023) as your compass:
@@ -110,7 +107,8 @@ Focus first on API1, API5, API3, API2, API8. Be surgical: prefer 3–12 tests.
   * Only suggest safe, inert SSRF checks (e.g., reject internal hostnames);
     do NOT probe internal networks.
 - For sensitive business flows (API6):
-  * If endpoints look like account takeover, password reset, create light tests that validate guardrails (e.g., OTP required).
+  * If endpoints look like account takeover, password reset, coupon abuse,
+    create light tests that validate guardrails (e.g., OTP required).
 
 === OUTPUT FORMAT (STRICT JSON) ===
 {
@@ -123,26 +121,25 @@ Focus first on API1, API5, API3, API2, API8. Be surgical: prefer 3–12 tests.
         "method": "GET|POST|PUT|PATCH|DELETE",
         "path": "/path/with/{id}",
         "auth": "none|user|admin|expired",
-        "headers": [{"key":"Authorization","value":"Bearer {{user_token}}"}],  // only if auth != none
-        "body": { ... }   // omit if not needed
+        "headers": [{"key":"Authorization","value":"Bearer {{user_token}}"}],
+        "body": { }
       },
       "assertions": [
         {"type":"status","op":"eq","value":403},
         {"type":"headerContains","key":"Cache-Control","value":"no-store"},
         {"type":"jsonPath","path":"$.status","op":"notEq","value":"APPROVED"}
       ],
-      "notes": "why this proves/denies the risk; link to endpoint/folder if provided"
+      "notes": "why this proves/denies the risk"
     }
   ]
 }
 - Keep to 3–12 tests. Choose the most promising endpoints for each risk class.
 - Use concrete IDs or simple neighbor ids when path params are present (e.g., 1→2).
 - Never echo secrets or real tokens. Rely on placeholders and environment variables.
-`) 
-    .replace("${api_summary}", JSON.stringify(apiSummary, null, 2))
-    .replace("${recent_changes}", recentChanges)
-    .replace("${policy}", policy)
-    .replace("${base_url}", baseUrl);
+`.replace("\\${api_summary}", JSON.stringify(apiSummary, null, 2))
+ .replace("\\${recent_changes}", recentChanges)
+ .replace("\\${policy}", policy)
+ .replace("\\${base_url}", baseUrl);
 
   const res = await openai.chat.completions.create({
     model: "gpt-4o-mini",
@@ -192,12 +189,10 @@ Focus first on API1, API5, API3, API2, API8. Be surgical: prefer 3–12 tests.
     })
   };
 
-  // Inject folder into PR-scoped copy
   const prCollection = JSON.parse(JSON.stringify(baseCollection));
   prCollection.item ||= [];
   prCollection.item.push(securityFolder);
 
-  // Derive PR env
   const prEnv = JSON.parse(JSON.stringify(baseEnv));
   envSet(prEnv, "baseUrl", baseUrl);
 
