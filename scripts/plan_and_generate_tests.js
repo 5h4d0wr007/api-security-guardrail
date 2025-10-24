@@ -1,4 +1,3 @@
-// scripts/plan_and_generate_tests.js
 import fs from "fs/promises";
 import path from "path";
 import OpenAI from "openai";
@@ -59,92 +58,82 @@ async function main() {
   const apiSummary = summarizeCollection(baseCollection);
   const recentChanges = process.env.PR_DIFF_SUMMARY || "(none)";
 
-  // Build the prompt strictly with concatenated strings (no backticks anywhere).
-  const promptParts = [
-    "You are an API security test planner. Goal: generate targeted, minimal, high-signal",
-    "tests for the API described below, mapped to OWASP API Security Top 10 (2023).",
-    "",
-    "=== CONTEXT ===",
-    "- API summary (from Postman collection):",
-    JSON.stringify(apiSummary, null, 2),
-    "",
-    "- Recent PR changes (optional; may be empty):",
-    recentChanges,
-    "",
-    "- Execution base URL: " + baseUrl,
-    "",
-    "- Org policy: " + policy,
-    "",
-    "=== RULES & PRIORITIES ===",
-    "Use OWASP API Security Top 10 (2023) as your compass:",
-    "API1 Broken Object Level Authorization (BOLA)",
-    "API2 Broken Authentication",
-    "API3 Broken Object Property Level Authorization (BOPLA / mass-assign)",
-    "API4 Unrestricted Resource Consumption",
-    "API5 Broken Function Level Authorization (BFLA)",
-    "API6 Unrestricted Access to Sensitive Business Flows",
-    "API7 Server-Side Request Forgery (SSRF)",
-    "API8 Security Misconfiguration",
-    "API9 Improper Inventory Management",
-    "API10 Unsafe Consumption of APIs",
-    "Focus first on API1, API5, API3, API2, API8. Be surgical: prefer 3–12 tests.",
-    "",
-    "=== TEST DESIGN GUIDELINES ===",
-    "- Prefer dynamic tests that prove risk with concrete assertions (status codes, headers,",
-    "  response fields, negative cases). Keep payloads minimal.",
-    "- DO NOT include secrets in outputs. Use placeholders referencing environment vars:",
-    "  {{user_token}}, {{admin_token}}, {{expired_token}}",
-    "- For auth/BOLA/BFLA:",
-    "  * Create variants: no token, user token, admin token, expired token.",
-    "  * For GET/PUT/DELETE /resource/{id}, try neighbor/foreign IDs (IDOR).",
-    "- For BOPLA (mass-assign):",
-    "  * POST/PUT/PATCH: inject extra fields like \"role\":\"admin\", \"status\":\"APPROVED\",",
-    "    or immutable/derived fields; expect they are ignored/rejected.",
-    "- For Misconfiguration:",
-    "  * On sensitive reads, assert Cache-Control includes \"no-store\".",
-    "  * Check security headers presence if relevant (optional).",
-    "- For rate/quotas (API4):",
-    "  * Small burst (3–10 rapid calls) and assert RateLimit-* / Retry-After",
-    "    (if the API claims limits). Keep load tiny to be CI-safe.",
-    "- For SSRF (API7):",
-    "  * Only suggest safe, inert SSRF checks (e.g., reject internal hostnames);",
-    "    do NOT probe internal networks.",
-    "- For sensitive business flows (API6):",
-    "  * If endpoints look like account takeover, password reset, coupon abuse,",
-    "    create light tests that validate guardrails (e.g., OTP required).",
-    "",
-    "=== OUTPUT FORMAT (STRICT JSON) ===",
-    "{",
-    "  \"tests\": [",
-    "    {",
-    "      \"name\": \"short, descriptive\",",
-    "      \"owasp\": \"API1:2023\",",
-    "      \"risk\": \"high|medium|low\",",
-    "      \"request\": {",
-    "        \"method\": \"GET|POST|PUT|PATCH|DELETE\",",
-    "        \"path\": \"/path/with/{id}\",",
-    "        \"auth\": \"none|user|admin|expired\",",
-    "        \"headers\": [{\"key\":\"Authorization\",\"value\":\"Bearer {{user_token}}\"}],",
-    "        \"body\": { }",
-    "      },",
-    "      \"assertions\": [",
-    "        {\"type\":\"status\",\"op\":\"eq\",\"value\":403},",
-    "        {\"type\":\"headerContains\",\"key\":\"Cache-Control\",\"value\":\"no-store\"},",
-    "        {\"type\":\"jsonPath\",\"path\":\"$.status\",\"op\":\"notEq\",\"value\":\"APPROVED\"}",
-    "      ],",
-    "      \"notes\": \"why this proves/denies the risk\"",
-    "    }",
-    "  ]",
-    "}",
-    "- Keep to 3–12 tests. Choose the most promising endpoints for each risk class.",
-    "- Use concrete IDs or simple neighbor ids when path params are present (e.g., 1→2).",
-    "- Never echo secrets or real tokens. Rely on placeholders and environment variables."
-  ];
-  const prompt = promptParts.join("\n");
+  // Build prompt via concatenation only (NO backticks), and assert no ${ sneaks in.
+  const prompt =
+    "You are an API security test planner. Goal: generate targeted, minimal, high-signal\n" +
+    "tests for the API described below, mapped to OWASP API Security Top 10 (2023).\n\n" +
+    "=== CONTEXT ===\n" +
+    "- API summary (from Postman collection):\n" +
+    JSON.stringify(apiSummary, null, 2) + "\n\n" +
+    "- Recent PR changes (optional; may be empty):\n" +
+    recentChanges + "\n\n" +
+    "- Execution base URL: " + baseUrl + "\n\n" +
+    "- Org policy: " + policy + "\n\n" +
+    "=== RULES & PRIORITIES ===\n" +
+    "Use OWASP API Security Top 10 (2023) as your compass:\n" +
+    "API1 Broken Object Level Authorization (BOLA)\n" +
+    "API2 Broken Authentication\n" +
+    "API3 Broken Object Property Level Authorization (BOPLA / mass-assign)\n" +
+    "API4 Unrestricted Resource Consumption\n" +
+    "API5 Broken Function Level Authorization (BFLA)\n" +
+    "API6 Unrestricted Access to Sensitive Business Flows\n" +
+    "API7 Server-Side Request Forgery (SSRF)\n" +
+    "API8 Security Misconfiguration\n" +
+    "API9 Improper Inventory Management\n" +
+    "API10 Unsafe Consumption of APIs\n" +
+    "Focus first on API1, API5, API3, API2, API8. Be surgical: prefer 3–12 tests.\n\n" +
+    "=== TEST DESIGN GUIDELINES ===\n" +
+    "- Prefer dynamic tests that prove risk with concrete assertions (status codes, headers,\n" +
+    "  response fields, negative cases). Keep payloads minimal.\n" +
+    "- DO NOT include secrets in outputs. Use placeholders referencing environment vars:\n" +
+    "  {{user_token}}, {{admin_token}}, {{expired_token}}\n" +
+    "- For auth/BOLA/BFLA:\n" +
+    "  * Create variants: no token, user token, admin token, expired token.\n" +
+    "  * For GET/PUT/DELETE /resource/{id}, try neighbor/foreign IDs (IDOR).\n" +
+    "- For BOPLA (mass-assign):\n" +
+    "  * POST/PUT/PATCH: inject extra fields like \"role\":\"admin\", \"status\":\"APPROVED\",\n" +
+    "    or immutable/derived fields; expect they are ignored/rejected.\n" +
+    "- For Misconfiguration:\n" +
+    "  * On sensitive reads, assert Cache-Control includes \"no-store\".\n" +
+    "  * Check security headers presence if relevant (optional).\n" +
+    "- For rate/quotas (API4):\n" +
+    "  * Small burst (3–10 rapid calls) and assert RateLimit-* / Retry-After\n" +
+    "    (if the API claims limits). Keep load tiny to be CI-safe.\n" +
+    "- For SSRF (API7):\n" +
+    "  * Only suggest safe, inert SSRF checks (e.g., reject internal hostnames);\n" +
+    "    do NOT probe internal networks.\n" +
+    "- For sensitive business flows (API6):\n" +
+    "  * If endpoints look like account takeover, password reset, coupon abuse,\n" +
+    "    create light tests that validate guardrails (e.g., OTP required).\n\n" +
+    "=== OUTPUT FORMAT (STRICT JSON) ===\n" +
+    "{\n" +
+    "  \"tests\": [\n" +
+    "    {\n" +
+    "      \"name\": \"short, descriptive\",\n" +
+    "      \"owasp\": \"API1:2023\",\n" +
+    "      \"risk\": \"high|medium|low\",\n" +
+    "      \"request\": {\n" +
+    "        \"method\": \"GET|POST|PUT|PATCH|DELETE\",\n" +
+    "        \"path\": \"/path/with/{id}\",\n" +
+    "        \"auth\": \"none|user|admin|expired\",\n" +
+    "        \"headers\": [{\"key\":\"Authorization\",\"value\":\"Bearer {{user_token}}\"}],\n" +
+    "        \"body\": { }\n" +
+    "      },\n" +
+    "      \"assertions\": [\n" +
+    "        {\"type\":\"status\",\"op\":\"eq\",\"value\":403},\n" +
+    "        {\"type\":\"headerContains\",\"key\":\"Cache-Control\",\"value\":\"no-store\"},\n" +
+    "        {\"type\":\"jsonPath\",\"path\":\"$.status\",\"op\":\"notEq\",\"value\":\"APPROVED\"}\n" +
+    "      ],\n" +
+    "      \"notes\": \"why this proves/denies the risk\"\n" +
+    "    }\n" +
+    "  ]\n" +
+    "}\n" +
+    "- Keep to 3–12 tests. Choose the most promising endpoints for each risk class.\n" +
+    "- Use concrete IDs or simple neighbor ids when path params are present (e.g., 1→2).\n" +
+    "- Never echo secrets or real tokens. Rely on placeholders and environment variables.\n";
 
-  // Safety guard: if ANY accidental ${ shows up, abort loudly.
   if (prompt.indexOf("${") !== -1) {
-    throw new Error("Prompt contains '${...}' which would cause JS interpolation. Aborting.");
+    throw new Error("Prompt contains '${...}'. Remove any template-literal placeholders.");
   }
 
   const res = await openai.chat.completions.create({
@@ -183,7 +172,7 @@ async function main() {
               if (a.type === "jsonPath") {
                 const p = String(a.path || "").replace(/"/g,'\\"');
                 const val = JSON.stringify(a.value);
-                if (a.op === "exists")      return "pm.test(\"jsonPath exists " + p + "\", function(){ var j=pm.response.json(); var v; try{ v = " + "j" + "; }catch(e){} pm.expect(_.get(j, \"" + p + "\")).to.not.equal(undefined); });";
+                if (a.op === "exists")      return "pm.test(\"jsonPath exists " + p + "\", function(){ var j=pm.response.json(); pm.expect(_.get(j, \"" + p + "\")).to.not.equal(undefined); });";
                 if (a.op === "eq")          return "pm.test(\"jsonPath eq " + p + "\", function(){ var j=pm.response.json(); pm.expect(_.get(j, \"" + p + "\")).to.eql(" + val + "); });";
                 if (a.op === "notEq")       return "pm.test(\"jsonPath notEq " + p + "\", function(){ var j=pm.response.json(); pm.expect(_.get(j, \"" + p + "\")).to.not.eql(" + val + "); });";
                 if (a.op === "notContains") return "pm.test(\"jsonPath notContains " + p + "\", function(){ var j=pm.response.json(); var s = String(_.get(j, \"" + p + "\")||\"\"); pm.expect(s).to.not.include(\"" + a.value + "\"); });";
@@ -196,12 +185,10 @@ async function main() {
     })
   };
 
-  // Inject into PR-scoped copy
   const prCollection = JSON.parse(JSON.stringify(baseCollection));
   prCollection.item ||= [];
   prCollection.item.push(securityFolder);
 
-  // Derive PR env
   const prEnv = JSON.parse(JSON.stringify(baseEnv));
   envSet(prEnv, "baseUrl", baseUrl);
 
