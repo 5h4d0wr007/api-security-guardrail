@@ -10,6 +10,7 @@ const baseCollPath = path.join(REPO, "postman/base.collection.json");
 const baseEnvPath  = path.join(REPO, "postman/base.environment.json");
 const prCollPath   = path.join(REPO, "postman/pr.collection.json");
 const prEnvPath    = path.join(REPO, "postman/pr.environment.json");
+const promptPath   = path.join(REPO, "scripts/planner_prompt.txt");
 
 function envGet(env, key, def="") {
   const v = (env.values || []).find(x => x.key === key);
@@ -22,7 +23,6 @@ function envSet(env, key, value) {
   else env.values.push({ key, value, enabled: true });
 }
 
-// Build compact summary of endpoints from the collection (no secrets)
 function summarizeCollection(coll) {
   const endpoints = [];
   const walk = (items, folder=[]) => {
@@ -47,89 +47,6 @@ function summarizeCollection(coll) {
   return Array.from(uniq.values()).slice(0, 200);
 }
 
-// ---------- SAFE PROMPT WITH CUSTOM TOKENS (no ${...} anywhere) ----------
-const PROMPT_TEMPLATE = `
-You are an API security test planner. Goal: generate targeted, minimal, high-signal
-tests for the API described below, mapped to OWASP API Security Top 10 (2023).
-
-=== CONTEXT ===
-- API summary (from Postman collection):
-__API_SUMMARY__
-
-- Recent PR changes (optional; may be empty):
-__RECENT_CHANGES__
-
-- Execution base URL: __BASE_URL__
-
-- Org policy: __POLICY__
-
-=== RULES & PRIORITIES ===
-Use OWASP API Security Top 10 (2023) as your compass:
-API1 Broken Object Level Authorization (BOLA)
-API2 Broken Authentication
-API3 Broken Object Property Level Authorization (BOPLA / mass-assign)
-API4 Unrestricted Resource Consumption
-API5 Broken Function Level Authorization (BFLA)
-API6 Unrestricted Access to Sensitive Business Flows
-API7 Server-Side Request Forgery (SSRF)
-API8 Security Misconfiguration
-API9 Improper Inventory Management
-API10 Unsafe Consumption of APIs
-Focus first on API1, API5, API3, API2, API8. Be surgical: prefer 3–12 tests.
-
-=== TEST DESIGN GUIDELINES ===
-- Prefer dynamic tests that prove risk with concrete assertions (status codes, headers,
-  response fields, negative cases). Keep payloads minimal.
-- DO NOT include secrets in outputs. Use placeholders referencing environment vars:
-  {{user_token}}, {{admin_token}}, {{expired_token}}
-- For auth/BOLA/BFLA:
-  * Create variants: no token, user token, admin token, expired token.
-  * For GET/PUT/DELETE /resource/{id}, try neighbor/foreign IDs (IDOR).
-- For BOPLA (mass-assign):
-  * POST/PUT/PATCH: inject extra fields like "role":"admin", "status":"APPROVED",
-    or immutable/derived fields; expect they are ignored/rejected.
-- For Misconfiguration:
-  * On sensitive reads, assert Cache-Control includes "no-store".
-  * Check security headers presence if relevant (optional).
-- For rate/quotas (API4):
-  * Small burst (3–10 rapid calls) and assert RateLimit-* / Retry-After
-    (if the API claims limits). Keep load tiny to be CI-safe.
-- For SSRF (API7):
-  * Only suggest safe, inert SSRF checks (e.g., reject internal hostnames);
-    do NOT probe internal networks.
-- For sensitive business flows (API6):
-  * If endpoints look like account takeover, password reset, coupon abuse,
-    create light tests that validate guardrails (e.g., OTP required).
-
-=== OUTPUT FORMAT (STRICT JSON) ===
-{
-  "tests": [
-    {
-      "name": "short, descriptive",
-      "owasp": "API1:2023",
-      "risk": "high|medium|low",
-      "request": {
-        "method": "GET|POST|PUT|PATCH|DELETE",
-        "path": "/path/with/{id}",
-        "auth": "none|user|admin|expired",
-        "headers": [{"key":"Authorization","value":"Bearer {{user_token}}"}],  // only if auth != none
-        "body": { }   // omit if not needed
-      },
-      "assertions": [
-        {"type":"status","op":"eq","value":403},
-        {"type":"headerContains","key":"Cache-Control","value":"no-store"},
-        {"type":"jsonPath","path":"$.status","op":"notEq","value":"APPROVED"}
-      ],
-      "notes": "why this proves/denies the risk"
-    }
-  ]
-}
-- Keep to 3–12 tests. Choose the most promising endpoints for each risk class.
-- Use concrete IDs or simple neighbor ids when path params are present (e.g., 1→2).
-- Never echo secrets or real tokens. Rely on placeholders and environment variables.
-`;
-// -------------------------------------------------------------------------
-
 async function main() {
   const baseCollection = JSON.parse(await fs.readFile(baseCollPath, "utf8"));
   const baseEnv = JSON.parse(await fs.readFile(baseEnvPath, "utf8"));
@@ -139,17 +56,24 @@ async function main() {
   const apiSummary = summarizeCollection(baseCollection);
   const recentChanges = process.env.PR_DIFF_SUMMARY || "(none)";
 
-  // Fill tokens safely
-  const PROMPT =
-    PROMPT_TEMPLATE
-      .replace("__API_SUMMARY__", JSON.stringify(apiSummary, null, 2))
-      .replace("__RECENT_CHANGES__", recentChanges)
-      .replace("__BASE_URL__", baseUrl)
-      .replace("__POLICY__", policy);
+  // Load prompt text from file
+  let prompt = await fs.readFile(promptPath, "utf8");
+
+  // Hard guard: fail fast if any ${ is present (would cause your earlier error)
+  if (prompt.includes("${")) {
+    throw new Error("Planner prompt contains '${...}'. Replace with custom tokens like __API_SUMMARY__.");
+  }
+
+  // Fill tokens
+  prompt = prompt
+    .replaceAll("__API_SUMMARY__", JSON.stringify(apiSummary, null, 2))
+    .replaceAll("__RECENT_CHANGES__", recentChanges)
+    .replaceAll("__BASE_URL__", baseUrl)
+    .replaceAll("__POLICY__", policy);
 
   const res = await openai.chat.completions.create({
     model: "gpt-4o-mini",
-    messages: [{ role: "user", content: PROMPT }],
+    messages: [{ role: "user", content: prompt }],
     response_format: { type: "json_object" }
   });
 
@@ -195,12 +119,11 @@ async function main() {
     })
   };
 
-  // Inject folder into PR-scoped copy
+  // Inject into PR-scoped copies
   const prCollection = JSON.parse(JSON.stringify(baseCollection));
   prCollection.item ||= [];
   prCollection.item.push(securityFolder);
 
-  // Derive PR env
   const prEnv = JSON.parse(JSON.stringify(baseEnv));
   envSet(prEnv, "baseUrl", baseUrl);
 
