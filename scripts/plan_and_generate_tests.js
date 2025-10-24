@@ -22,7 +22,7 @@ function envSet(env, key, value) {
   else env.values.push({ key, value, enabled: true });
 }
 
-// Build compact summary of endpoints from the collection
+// Build compact summary of endpoints from the collection (no secrets)
 function summarizeCollection(coll) {
   const endpoints = [];
   const walk = (items, folder=[]) => {
@@ -47,30 +47,21 @@ function summarizeCollection(coll) {
   return Array.from(uniq.values()).slice(0, 200);
 }
 
-async function main() {
-  const baseCollection = JSON.parse(await fs.readFile(baseCollPath, "utf8"));
-  const baseEnv = JSON.parse(await fs.readFile(baseEnvPath, "utf8"));
-
-  const baseUrl = process.env.PR_BASEURL || envGet(baseEnv, "baseUrl", "http://localhost:8888");
-  const policy = "Block on High; warn on Medium/Low.";
-  const apiSummary = summarizeCollection(baseCollection);
-  const recentChanges = process.env.PR_DIFF_SUMMARY || "(none)";
-
-  // IMPORTANT: Use String.raw and escape ${...} → \${...}
-  const PROMPT = String.raw`
+// ---------- SAFE PROMPT WITH CUSTOM TOKENS (no ${...} anywhere) ----------
+const PROMPT_TEMPLATE = `
 You are an API security test planner. Goal: generate targeted, minimal, high-signal
 tests for the API described below, mapped to OWASP API Security Top 10 (2023).
 
 === CONTEXT ===
 - API summary (from Postman collection):
-\${api_summary}
+__API_SUMMARY__
 
 - Recent PR changes (optional; may be empty):
-\${recent_changes}
+__RECENT_CHANGES__
 
-- Execution base URL: \${base_url}
+- Execution base URL: __BASE_URL__
 
-- Org policy: \${policy}
+- Org policy: __POLICY__
 
 === RULES & PRIORITIES ===
 Use OWASP API Security Top 10 (2023) as your compass:
@@ -121,8 +112,8 @@ Focus first on API1, API5, API3, API2, API8. Be surgical: prefer 3–12 tests.
         "method": "GET|POST|PUT|PATCH|DELETE",
         "path": "/path/with/{id}",
         "auth": "none|user|admin|expired",
-        "headers": [{"key":"Authorization","value":"Bearer {{user_token}}"}],
-        "body": { }
+        "headers": [{"key":"Authorization","value":"Bearer {{user_token}}"}],  // only if auth != none
+        "body": { }   // omit if not needed
       },
       "assertions": [
         {"type":"status","op":"eq","value":403},
@@ -136,10 +127,25 @@ Focus first on API1, API5, API3, API2, API8. Be surgical: prefer 3–12 tests.
 - Keep to 3–12 tests. Choose the most promising endpoints for each risk class.
 - Use concrete IDs or simple neighbor ids when path params are present (e.g., 1→2).
 - Never echo secrets or real tokens. Rely on placeholders and environment variables.
-`.replace("\\${api_summary}", JSON.stringify(apiSummary, null, 2))
- .replace("\\${recent_changes}", recentChanges)
- .replace("\\${policy}", policy)
- .replace("\\${base_url}", baseUrl);
+`;
+// -------------------------------------------------------------------------
+
+async function main() {
+  const baseCollection = JSON.parse(await fs.readFile(baseCollPath, "utf8"));
+  const baseEnv = JSON.parse(await fs.readFile(baseEnvPath, "utf8"));
+
+  const baseUrl = process.env.PR_BASEURL || envGet(baseEnv, "baseUrl", "http://localhost:8888");
+  const policy = "Block on High; warn on Medium/Low.";
+  const apiSummary = summarizeCollection(baseCollection);
+  const recentChanges = process.env.PR_DIFF_SUMMARY || "(none)";
+
+  // Fill tokens safely
+  const PROMPT =
+    PROMPT_TEMPLATE
+      .replace("__API_SUMMARY__", JSON.stringify(apiSummary, null, 2))
+      .replace("__RECENT_CHANGES__", recentChanges)
+      .replace("__BASE_URL__", baseUrl)
+      .replace("__POLICY__", policy);
 
   const res = await openai.chat.completions.create({
     model: "gpt-4o-mini",
@@ -176,23 +182,25 @@ Focus first on API1, API5, API3, API2, API8. Be surgical: prefer 3–12 tests.
               }
               if (a.type === "jsonPath") {
                 const p = a.path.replace(/"/g,'\\"');
-                if (a.op === "exists")   return `pm.test("jsonPath exists ${p}", ()=>pm.expect(_.get(pm.response.json(), "${p}")).to.not.equal(undefined))`;
-                if (a.op === "eq")       return `pm.test("jsonPath eq ${p}", ()=>pm.expect(_.get(pm.response.json(), "${p}")).to.eql(${JSON.stringify(a.value)}))`;
-                if (a.op === "notEq")    return `pm.test("jsonPath notEq ${p}", ()=>pm.expect(_.get(pm.response.json(), "${p}")).to.not.eql(${JSON.stringify(a.value)}))`;
-                if (a.op === "notContains") return `pm.test("jsonPath notContains ${p}", ()=>pm.expect(String(_.get(pm.response.json(), "${p}")||"")).to.not.include("${a.value}"))`;
+                if (a.op === "exists")        return `pm.test("jsonPath exists ${p}", ()=>pm.expect(_.get(pm.response.json(), "${p}")).to.not.equal(undefined))`;
+                if (a.op === "eq")            return `pm.test("jsonPath eq ${p}", ()=>pm.expect(_.get(pm.response.json(), "${p}")).to.eql(${JSON.stringify(a.value)}))`;
+                if (a.op === "notEq")         return `pm.test("jsonPath notEq ${p}", ()=>pm.expect(_.get(pm.response.json(), "${p}")).to.not.eql(${JSON.stringify(a.value)}))`;
+                if (a.op === "notContains")   return `pm.test("jsonPath notContains ${p}", ()=>pm.expect(String(_.get(pm.response.json(), "${p}")||"")).to.not.include("${a.value}"))`;
               }
               return `pm.test("no-op", ()=>pm.expect(true).to.be.true)`;
             })
           }
         }]
-      }
+      };
     })
   };
 
+  // Inject folder into PR-scoped copy
   const prCollection = JSON.parse(JSON.stringify(baseCollection));
   prCollection.item ||= [];
   prCollection.item.push(securityFolder);
 
+  // Derive PR env
   const prEnv = JSON.parse(JSON.stringify(baseEnv));
   envSet(prEnv, "baseUrl", baseUrl);
 
