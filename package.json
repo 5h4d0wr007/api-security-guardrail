@@ -1,0 +1,16 @@
+{
+  "name": "api-security-guardrail",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "plan": "node scripts/plan_and_generate_tests.js",
+    "sarif": "node scripts/newman_to_sarif.js"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2",
+    "openai": "^4.68.4"
+  },
+  "devDependencies": {
+    "newman": "^6.2.0"
+  }
+}

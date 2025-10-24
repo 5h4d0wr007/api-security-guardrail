@@ -1,0 +1,61 @@
+name: API Security Guardrail
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+jobs:
+  guardrail:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1) Start crAPI for the tests
+      - name: Launch crAPI (Docker)
+        run: |
+          curl -L -o crapi.zip https://github.com/OWASP/crAPI/archive/refs/heads/main.zip
+          unzip -q crapi.zip
+          cd crAPI-main/deploy/docker
+          docker compose pull
+          docker compose -f docker-compose.yml --compatibility up -d
+          for i in {1..60}; do curl -fsS http://localhost:8888/ >/dev/null && break; sleep 3; done
+
+      # 2) Start Postman MCP (minimal)
+      - name: Start Postman MCP
+        run: |
+          npx @postmanlabs/postman-mcp-server --stdio --tools minimal &
+          echo $! > mcp.pid
+        env:
+          POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
+
+      # 3) Node + deps
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+
+      # 4) Plan tests (generic OWASP Top-10)
+      - name: Plan & generate tests
+        run: npm run plan
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PR_BASEURL: http://localhost:8888
+
+      # 5) Execute with Newman
+      - name: Run collection
+        run: |
+          npx newman run ./postman/pr.collection.json \
+            -e ./postman/pr.environment.json \
+            -r cli,json --reporter-json-export run.json
+
+      # 6) Convert & upload SARIF
+      - name: Convert to SARIF
+        run: npm run sarif
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
